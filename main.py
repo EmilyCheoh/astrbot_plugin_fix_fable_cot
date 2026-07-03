@@ -83,9 +83,9 @@ def _split_leaked_cot(text: str) -> tuple[str, str] | None:
     "1.0.0",
 )
 class FixFableCotPlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
-        self.config = config
+        self.config = config or {}
 
     def _is_affected_model(self, provider_id: str) -> bool:
         """Check if the current provider matches any affected model in config."""
