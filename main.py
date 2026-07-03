@@ -2,7 +2,7 @@
 Fable CoT Leak Fix
 
 Fable 模型偶尔将第二层思考链泄漏到正文中，与实际回复粘连，
-中间缺少空格（例如 "dissect.Yes"）。
+中间缺少空格（例如 "dissect.Yes" "right?The" "now!She"）。
 
 本插件在两个阶段修复：
 1. on_decorating_result — 实时 cosmetic：
@@ -13,39 +13,67 @@ Fable 模型偶尔将第二层思考链泄漏到正文中，与实际回复粘�
    将残留的泄漏 CoT 从上下文历史中清除，
    确保 LLM 收到的上下文是干净的。
 
+安全措施：
+- 跳过代码块（```...```）和行内代码（`...`）内的匹配
+- 仅在配置中指定的模型上启用
+
 F(A) = A(F)
 """
 
 import re
 
+from astrbot.api import logger, AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.message_components import Node, Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
 
-# Pattern: lowercase letter + period + uppercase letter with no space between.
-# This is the seam where Fable's leaked CoT glues onto the actual response.
-LEAK_BOUNDARY = re.compile(r"[a-z]\.[A-Z]")
+# Pattern: lowercase letter + sentence-ending punctuation + uppercase letter,
+# with no space between. Covers period, question mark, and exclamation mark.
+LEAK_BOUNDARY = re.compile(r"[a-z][.?!][A-Z]")
+
+# Patterns for detecting code spans to skip
+CODE_BLOCK = re.compile(r"```[\s\S]*?```")
+INLINE_CODE = re.compile(r"`[^`]+`")
+
+
+def _find_code_ranges(text: str) -> list[tuple[int, int]]:
+    """Find all character ranges that are inside code blocks or inline code."""
+    ranges = []
+    for m in CODE_BLOCK.finditer(text):
+        ranges.append((m.start(), m.end()))
+    for m in INLINE_CODE.finditer(text):
+        ranges.append((m.start(), m.end()))
+    return ranges
+
+
+def _is_in_code(pos: int, code_ranges: list[tuple[int, int]]) -> bool:
+    """Check if a position falls inside any code range."""
+    return any(start <= pos < end for start, end in code_ranges)
 
 
 def _split_leaked_cot(text: str) -> tuple[str, str] | None:
     """
-    If the text contains a leaked CoT boundary, return (leaked_cot, actual_response).
-    Otherwise return None.
+    If the text contains a leaked CoT boundary (outside code spans),
+    return (leaked_cot, actual_response). Otherwise return None.
     """
-    match = LEAK_BOUNDARY.search(text)
-    if not match:
-        return None
+    code_ranges = _find_code_ranges(text)
 
-    split_pos = match.start() + 2
-    leaked_cot = text[:split_pos].strip()
-    actual_response = text[split_pos:].strip()
+    for match in LEAK_BOUNDARY.finditer(text):
+        if _is_in_code(match.start(), code_ranges):
+            continue
 
-    if not leaked_cot or not actual_response:
-        return None
+        # Found a valid boundary outside code
+        split_pos = match.start() + 2
+        leaked_cot = text[:split_pos].strip()
+        actual_response = text[split_pos:].strip()
 
-    return leaked_cot, actual_response
+        if not leaked_cot or not actual_response:
+            continue
+
+        return leaked_cot, actual_response
+
+    return None
 
 
 @register(
@@ -55,8 +83,17 @@ def _split_leaked_cot(text: str) -> tuple[str, str] | None:
     "1.0.0",
 )
 class FixFableCotPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self.config = config
+
+    def _is_affected_model(self, provider_id: str) -> bool:
+        """Check if the current provider matches any affected model in config."""
+        affected = self.config.get("affected_models", [])
+        if not affected:
+            return False
+        provider_lower = provider_id.lower()
+        return any(model.lower() in provider_lower for model in affected)
 
     # ------------------------------------------------------------------
     # Stage 1: Cosmetic fix — split leaked CoT from display chain
@@ -65,6 +102,13 @@ class FixFableCotPlugin(Star):
     @filter.on_decorating_result()
     async def fix_display(self, event: AstrMessageEvent):
         try:
+            # Model gate
+            umo = event.unified_msg_origin
+            provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+            logger.info(f"fix_fable_cot [display]: provider_id = {provider_id!r}")
+            if not provider_id or not self._is_affected_model(provider_id):
+                return
+
             result = event.get_result()
             if not result:
                 return
@@ -184,6 +228,12 @@ class FixFableCotPlugin(Star):
     @filter.on_llm_request()
     async def fix_context(self, event: AstrMessageEvent, req: ProviderRequest):
         try:
+            # Model gate
+            umo = event.unified_msg_origin
+            provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+            if not provider_id or not self._is_affected_model(provider_id):
+                return
+
             if not hasattr(req, "contexts") or not req.contexts:
                 return
 
