@@ -3,4 +3,4 @@ display_name: "Fable CoT Leak Fix"
 desc: "Fable 模型泄漏的第二层 CoT 从正文中分离出来，以合并转发消息发送"
 version: v1.0.0
 author: "Felis Abyssalis & Abyss AI"
-repo: ""
+repo: "https://github.com/EmilyCheoh/astrbot_plugin_fix_fable_cot"
