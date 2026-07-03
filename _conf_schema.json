@@ -1,0 +1,7 @@
+{
+    "affected_models": {
+        "description": "受影响的模型 ID 列表。当前会话的 provider ID 包含列表中任一字符串时，插件才会启用。留空则插件不工作。",
+        "type": "list",
+        "default": []
+    }
+}
