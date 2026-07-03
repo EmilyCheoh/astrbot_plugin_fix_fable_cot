@@ -5,9 +5,9 @@ Fable 模型偶尔将第二层思考链泄漏到正文中，与实际回复粘�
 中间缺少空格（例如 "dissect.Yes" "right?The" "now!She"）。
 
 本插件在两个阶段修复：
-1. on_decorating_result — 实时 cosmetic：
+1. on_llm_response — 实时 cosmetic：
    检测泄漏边界，将泄漏的 CoT 以合并转发消息发送，
-   并将显示链中的正文替换为干净版本。
+   并将回复文本替换为干净版本。
 2. on_llm_request — 下一轮结构修复：
    扫描 req.contexts 中的 assistant 消息，
    将残留的泄漏 CoT 从上下文历史中清除，
@@ -23,7 +23,7 @@ F(A) = A(F)
 import re
 
 from astrbot.api import logger, AstrBotConfig
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.message_components import Node, Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
@@ -96,39 +96,25 @@ class FixFableCotPlugin(Star):
         return any(model.lower() in provider_lower for model in affected)
 
     # ------------------------------------------------------------------
-    # Stage 1: Cosmetic fix — split leaked CoT from display chain
+    # Stage 1: Cosmetic fix — split leaked CoT from LLM response
     # ------------------------------------------------------------------
 
-    @filter.on_decorating_result()
-    async def fix_display(self, event: AstrMessageEvent):
+    @filter.on_llm_response()
+    async def fix_display(self, event: AstrMessageEvent, resp):
         try:
             # Model gate
             umo = event.unified_msg_origin
             provider_id = await self.context.get_current_chat_provider_id(umo=umo)
-            logger.info(f"fix_fable_cot [display]: provider_id = {provider_id!r}")
             if not provider_id or not self._is_affected_model(provider_id):
-                return
+                return resp
 
-            result = event.get_result()
-            if not result:
-                return
+            text = getattr(resp, "_completion_text", None)
+            if not text or not isinstance(text, str):
+                return resp
 
-            chain = result.chain
-            if not isinstance(chain, list):
-                return
-
-            # Concatenate all Plain segments to find the leak boundary
-            full_text = ""
-            for component in chain:
-                if isinstance(component, Plain):
-                    full_text += component.text
-
-            if not full_text:
-                return
-
-            split = _split_leaked_cot(full_text)
+            split = _split_leaked_cot(text)
             if not split:
-                return
+                return resp
 
             leaked_cot, actual_response = split
 
@@ -142,23 +128,15 @@ class FixFableCotPlugin(Star):
             ]
             await event.send(event.chain_result(nodes))
 
-            # Replace all Plain segments in the chain with the clean response
-            first_plain_idx = None
-            to_remove = []
-            for i, component in enumerate(chain):
-                if isinstance(component, Plain):
-                    if first_plain_idx is None:
-                        first_plain_idx = i
-                    to_remove.append(i)
-
-            for i in reversed(to_remove):
-                chain.pop(i)
-
-            if first_plain_idx is not None:
-                chain.insert(first_plain_idx, Plain(actual_response))
+            # Patch the response text
+            resp._completion_text = actual_response
+            if resp.result_chain is not None:
+                resp.result_chain = MessageChain().message(actual_response)
 
         except Exception as e:
             logger.error(f"fix_fable_cot display fix failed: {e}")
+
+        return resp
 
     # ------------------------------------------------------------------
     # Stage 2: Structural fix — clean leaked CoT from context history
